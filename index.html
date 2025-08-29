@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>マイクラ風FPS 完全版</title>
+<style>
+body { margin:0; overflow:hidden; font-family:sans-serif; }
+canvas { display:block; }
+
+#crosshair {
+  position:absolute; top:50%; left:50%;
+  width:10px; height:10px; margin-left:-5px; margin-top:-5px;
+  border:2px solid red; border-radius:50%; pointer-events:none;
+}
+
+#inventory {
+  position:absolute; bottom:10px; left:50%; transform:translateX(-50%);
+  display:flex; gap:5px;
+}
+.inventory-slot {
+  width:40px; height:40px; background:#555; display:flex; align-items:center; justify-content:center;
+  color:white; font-size:12px; cursor:pointer; border:2px solid transparent;
+}
+.inventory-slot.active { border-color:yellow; }
+
+#chat-container {
+  position:absolute; bottom:10px; left:10px; color:white; font-family:monospace;
+}
+#chat-log { max-height:200px; overflow-y:auto; margin-bottom:5px; }
+#chat-input { display:none; width:300px; background:rgba(0,0,0,0.5); color:white; border:none; padding:5px; font-family:monospace; }
+</style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+<div id="crosshair"></div>
+<div id="inventory"></div>
+
+<div id="chat-container">
+  <div id="chat-log"></div>
+  <input type="text" id="chat-input">
+</div>
+
+<script type="module">
+import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.158.0/build/three.module.js';
+
+// --- Noiseクラス ---
+class Noise {
+  constructor() { 
+    this.grad3=[[1,1,0],[-1,1,0],[1,-1,0],[-1,-1,0],[1,0,1],[-1,0,1],[1,0,-1],[-1,0,-1],[0,1,1],[0,-1,1],[0,1,-1],[0,-1,-1]]; 
+    this.p=[]; for(let i=0;i<256;i++) this.p[i]=Math.floor(Math.random()*256); 
+    this.perm=[]; for(let i=0;i<512;i++) this.perm[i]=this.p[i & 255]; 
+  }
+  dot(g,x,y){ return g[0]*x + g[1]*y; }
+  mix(a,b,t){ return (1-t)*a + t*b; }
+  fade(t){ return t*t*t*(t*(t*6-15)+10); }
+  noise2D(x,y){
+    let X=Math.floor(x)&255,Y=Math.floor(y)&255;
+    let xx=x-Math.floor(x),yy=y-Math.floor(y);
+    let g00=this.grad3[this.perm[X+this.perm[Y]]%12];
+    let g10=this.grad3[this.perm[X+1+this.perm[Y]]%12];
+    let g01=this.grad3[this.perm[X+this.perm[Y+1]]%12];
+    let g11=this.grad3[this.perm[X+1+this.perm[Y+1]]%12];
+    let u=this.fade(xx),v=this.fade(yy);
+    let nx0=this.mix(this.dot(g00,xx,yy),this.dot(g10,xx-1,yy),u);
+    let nx1=this.mix(this.dot(g01,xx,yy-1),this.dot(g11,xx-1,yy-1),u);
+    return this.mix(nx0,nx1,v);
+  }
+}
+const noise = new Noise();
+
+// --- 基本設定 ---
+const canvas = document.getElementById('gameCanvas');
+const renderer = new THREE.WebGLRenderer({canvas});
+renderer.setSize(window.innerWidth,window.innerHeight);
+renderer.shadowMap.enabled=true;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87ceeb);
+
+const camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 1000);
+camera.position.set(0,20,0);
+
+scene.add(new THREE.AmbientLight(0xffffff,0.7));
+const dirLight = new THREE.DirectionalLight(0xffffff,0.8);
+dirLight.position.set(50,100,50);
+scene.add(dirLight);
+
+// --- ワールド設定 ---
+const WORLD_SIZE=64, WORLD_HEIGHT=20;
+const blockTypes=['Grass','Dirt','Stone','Ore','Bedrock','TNT'];
+const materials={
+  Grass:new THREE.MeshStandardMaterial({color:0x228822}),
+  Dirt:new THREE.MeshStandardMaterial({color:0x966f33}),
+  Stone:new THREE.MeshStandardMaterial({color:0x555555}),
+  Ore:new THREE.MeshStandardMaterial({color:0xffd700}),
+  Bedrock:new THREE.MeshStandardMaterial({color:0x000000}),
+  TNT:new THREE.MeshStandardMaterial({color:0xCF0000})
+};
+
+// --- InstancedMesh ---
+const geo=new THREE.BoxGeometry(1,1,1);
+const meshes={};
+for(const key in materials){
+  meshes[key]=new THREE.InstancedMesh(geo,materials[key],WORLD_SIZE*WORLD_SIZE*WORLD_HEIGHT);
+  meshes[key].count=0;
+  scene.add(meshes[key]);
+  meshes[key].instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+}
+
+// --- ブロック配置 ---
+function addBlock(type,x,y,z){
+  if(x<0 || x>=WORLD_SIZE || y<0 || y>WORLD_HEIGHT || z<0 || z>=WORLD_SIZE) return;
+  const m = new THREE.Matrix4().makeTranslation(x,y,z);
+  const mesh = meshes[type];
+  mesh.setMatrixAt(mesh.count,m);
+  mesh.count++;
+  mesh.instanceMatrix.needsUpdate=true;
+}
+
+// --- 高さ生成 ---
+function getHeight(x,z){
+  let h = 5;
+  const freqs=[32,16,8], amps=[5,3,1.5];
+  for(let i=0;i<freqs.length;i++){
+    h += noise.noise2D(x/freqs[i], z/freqs[i])*amps[i];
+  }
+  return Math.floor(h);
+}
+
+// --- ワールド生成 ---
+for(let x=0;x<WORLD_SIZE;x++){
+  for(let z=0;z<WORLD_SIZE;z++){
+    const h=getHeight(x,z);
+    for(let y=0;y<=h;y++){
+      let block;
+      if(y===0) block='Bedrock';
+      else if(y===h) block='Grass';
+      else if(y<h-3) block=(Math.random()<0.05?'Ore':'Stone');
+      else block='Dirt';
+      addBlock(block,x,y,z);
+    }
+  }
+}
+
+// --- プレイヤー ---
+const player={pos:camera.position.clone()};
+const key={};
+window.addEventListener('keydown', e=>{ key[e.code]=true; });
+window.addEventListener('keyup', e=>{ key[e.code]=false; });
+
+// --- インベントリ ---
+const inventory = new Array(9).fill(null);
+inventory[0]='Grass';
+inventory[1]='Dirt';
+inventory[3]='TNT';
+const slots=document.getElementById('inventory');
+let currentSlot=0;
+function updateInventoryUI(){
+  slots.innerHTML='';
+  for(let i=0;i<9;i++){
+    const div = document.createElement('div');
+    div.className='inventory-slot'+(i===currentSlot?' active':'');
+    div.dataset.index=i;
+    div.innerText = inventory[i]||'';
+    slots.appendChild(div);
+  }
+}
+updateInventoryUI();
+
+// --- マウスホイール切替 ---
+window.addEventListener('wheel', e=>{
+  if(document.activeElement===chatInput) return; // チャット中は無効
+  if(e.deltaY>0) currentSlot=(currentSlot+1)%9;
+  else currentSlot=(currentSlot+8)%9;
+  updateInventoryUI();
+});
+
+// --- Raycaster ---
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2(0,0);
+function getTargetBlock(){
+  raycaster.setFromCamera(mouse,camera);
+  const intersects=[];
+  for(const key in meshes){
+    const hits = raycaster.intersectObject(meshes[key], false);
+    hits.forEach(h => intersects.push({type:key,data:h}));
+  }
+  if(intersects.length>0){
+    intersects.sort((a,b)=>a.data.distance-b.data.distance);
+    return intersects[0];
+  }
+  return null;
+}
+
+// --- TNT爆発 ---
+function explode(pos){
+  const offsets = [-1,0,1];
+  for(let dx of offsets){
+    for(let dy of offsets){
+      for(let dz of offsets){
+        const targetX = Math.floor(pos.x+dx);
+        const targetY = Math.floor(pos.y+dy);
+        const targetZ = Math.floor(pos.z+dz);
+        for(const key in meshes){
+          const mesh = meshes[key];
+          for(let i=0;i<mesh.count;i++){
+            const matrix = new THREE.Matrix4();
+            mesh.getMatrixAt(i,matrix);
+            const v = new THREE.Vector3();
+            v.setFromMatrixPosition(matrix);
+            if(Math.floor(v.x)===targetX && Math.floor(v.y)===targetY && Math.floor(v.z)===targetZ){
+              mesh.setMatrixAt(i,new THREE.Matrix4().makeScale(0,0,0));
+              mesh.instanceMatrix.needsUpdate=true;
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// --- マウスクリック ---
+const chatInput = document.getElementById('chat-input');
+window.addEventListener('mousedown', e=>{
+  if(document.activeElement===chatInput) return; // チャット中は操作無効
+  const target = getTargetBlock();
+  if(!target) return;
+  const selectedType = inventory[currentSlot];
+  if(!selectedType) return;
+  if(e.button===0){ // 左クリック
+    target.data.object.setMatrixAt(target.data.instanceId,new THREE.Matrix4().makeScale(0,0,0));
+    target.data.object.instanceMatrix.needsUpdate=true;
+  } else if(e.button===2){ // 右クリック
+    const pos = target.data.point.clone().add(target.data.face.normal);
+    const x=Math.floor(pos.x), y=Math.floor(pos.y), z=Math.floor(pos.z);
+    addBlock(selectedType,x,y,z);
+    if(selectedType==='TNT'){
+      setTimeout(()=>explode(new THREE.Vector3(x,y,z)),2000);
+    }
+  }
+});
+canvas.addEventListener('contextmenu', e=>e.preventDefault());
+
+// --- 移動 ---
+function handleMovement(dt){
+  if(document.activeElement===chatInput) return; // チャット中は無効
+  const speed=10;
+  const dir=new THREE.Vector3();
+  if(key['KeyW']) dir.z-=1;
+  if(key['KeyS']) dir.z+=1;
+  if(key['KeyA']) dir.x-=1;
+  if(key['KeyD']) dir.x+=1;
+  if(key['Space']) dir.y+=1;
+  if(key['ShiftLeft']) dir.y-=1;
+  dir.normalize();
+  const forward=new THREE.Vector3(0,0,-1).applyQuaternion(camera.quaternion);
+  const right=new THREE.Vector3(1,0,0).applyQuaternion(camera.quaternion);
+  forward.y=0; right.y=0; forward.normalize(); right.normalize();
+  const move=new THREE.Vector3();
+  move.addScaledVector(forward,dir.z*speed*dt);
+  move.addScaledVector(right,dir.x*speed*dt);
+  move.y+=dir.y*speed*dt;
+  player.pos.add(move);
+}
+
+// --- カメラ ---
+let yaw=0,pitch=0;
+canvas.addEventListener('click',()=>canvas.requestPointerLock());
+document.addEventListener('mousemove', e=>{
+  if(document.activeElement===chatInput) return; // チャット中は無効
+  if(document.pointerLockElement!==canvas) return;
+  const sens=0.002;
+  yaw-=e.movementX*sens;
+  pitch-=e.movementY*sens;
+  pitch=Math.max(-Math.PI/2,Math.min(Math.PI/2,pitch));
+});
+function updateCamera(){ camera.position.copy(player.pos); camera.quaternion.setFromEuler(new THREE.Euler(pitch,yaw,0,'YXZ')); }
+
+// --- チャット ---
+const chatLog = document.getElementById('chat-log');
+window.addEventListener('keydown', e=>{
+  if(e.code==='Enter'){
+    if(document.activeElement!==chatInput){
+      chatInput.style.display='block';
+      chatInput.focus();
+    } else {
+      const text = chatInput.value.trim();
+      chatInput.value='';
+      chatInput.style.display='none';
+      if(text.length>0){
+        chatLog.innerHTML += '&gt; '+text+'<br>';
+        chatLog.scrollTop = chatLog.scrollHeight;
+        if(text.startsWith('/give ')){
+          const item = text.split(' ')[1];
+          if(blockTypes.includes(item)){
+            const emptyIndex=inventory.findIndex(i=>!i);
+            if(emptyIndex>=0){
+              inventory[emptyIndex]=item;
+              updateInventoryUI();
+            }
+          }
+        }
+      }
+    }
+  }
+});
+
+// --- メインループ ---
+let prev=performance.now();
+function loop(t){
+  const dt=(t-prev)/1000; prev=t;
+  handleMovement(dt);
+  updateCamera();
+  renderer.render(scene,camera);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
